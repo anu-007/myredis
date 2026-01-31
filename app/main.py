@@ -20,8 +20,12 @@ class RedisServer:
                 if response:
                     writer.write(response.encode())
                     writer.close()
+            print(self.map)
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            pass
         except Exception as e:
-            print(e)
+            if not isinstance(e, (ConnectionResetError, BrokenPipeError)):
+                print(e)
         finally:
             writer.close()
             await writer.wait_closed()
@@ -130,6 +134,143 @@ class RedisServer:
                 return f"*2\r\n${len(split_cmd[1])}\r\n{split_cmd[1]}\r\n${len(el)}\r\n{el}\r\n"
             else:
                 return EMPTY_RES
+        elif "TYPE" in command:
+            value = self.map.get(split_cmd[1], None)
+            if value is None:
+                return "none\r\n"
+            elif isinstance(value, list):
+                if isinstance(value[0], dict) and value[0].get("id", None):
+                    return "stream\r\n"
+                return "list\r\n"
+            elif isinstance(value, dict) and "val" in value:
+                return "string\r\n"
+            else:
+                return "none\r\n"
+        elif "XADD" in command:
+            key = split_cmd[1]
+            valid_id = self.validate_stream_id(command)
+            if not valid_id:
+                return "(error) ERR The ID specified in XADD is equal or smaller than the target stream top item"
+
+            value = self.map.get(key, [])
+            curr_obj = { "id": valid_id }
+            for idx in range(3, len(split_cmd), 2):
+                curr_obj[split_cmd[idx]] = split_cmd[idx+1]
+
+            value.append(curr_obj)
+            self.map[key] = value
+            return f"{len(valid_id)}\r\n{valid_id}\r\n"
+        elif "XRANGE" in command:
+            values = self.map.get(split_cmd[1], [])
+            if values is None:
+                return "*0\r\n"
+            start_id = split_cmd[2]
+            end_id = split_cmd[3]
+
+            res = []
+            for val in values:
+                val_id = val.get("id").split("-")
+                val_timestamp = int(val_id[0])
+                val_seq = int(val_id[1])
+
+                if start_id == "-":
+                    start_match = True
+                else:
+                    start_part = start_id.split("-")
+                    start_timestamp = int(start_part[0])
+                    start_seq = int(start_part[1]) if len(start_part) > 1 else 0
+                    start_match = (val_timestamp > start_timestamp or (val_timestamp == start_timestamp and val_seq >= start_seq))
+                    
+                if end_id == "+":
+                    end_match = True
+                else:
+                    end_parts = end_id.split('-')
+                    end_timestamp = int(end_parts[0])
+                    end_seq = int(end_parts[1]) if len(end_parts) > 1 else float('inf')
+                    end_match = (val_timestamp < end_timestamp or 
+                                (val_timestamp == end_timestamp and val_seq <= end_seq))
+
+                if start_match and end_match:
+                    res.append(val)
+
+            resp = f"*{len(res)}\r\n"
+            for item in res:
+                resp += f"*2\r\n${len(item['id'])}\r\n{item['id']}\r\n"
+                field_count = len(item) - 1
+                resp += f"*{field_count * 2}\r\n"
+                for key, value in item.items():
+                    if key != 'id':
+                        resp += f"${len(key)}\r\n{key}\r\n${len(value)}\r\n{value}\r\n"
+            return resp
+        elif "XREAD" in command:
+            block_ms = None
+            streams_idx = split_cmd.index("STREAMS")
+
+            if "BLOCK" in split_cmd:
+                block_idx = split_cmd.index("BLOCK")
+                block_ms = int(split_cmd[block_idx + 1])
+
+            keys = split_cmd[streams_idx + 1:streams_idx + 1 + (len(split_cmd) - streams_idx - 1) // 2]
+            ids = split_cmd[streams_idx + 1 + len(keys):]
+            
+            result = []
+            start_time = datetime.now()
+            while True:
+                for key_idx, key in enumerate(keys):
+                    values = self.map.get(key, [])
+                    if values is None:
+                        continue
+                    
+                    if ids[key_idx] == "$":
+                        if values:
+                            last_id = values[-1].get("id").split("-")
+                            start_timestamp = int(last_id[0])
+                            start_seq = int(last_id[1])
+                        else:
+                            start_timestamp = 0
+                            start_seq = 0
+                    else:
+                        start_part = ids[key_idx].split("-")
+                        start_timestamp = int(start_part[0])
+                        start_seq = int(start_part[1])
+                
+                    res = []
+                    for val in values:
+                        val_id = val.get("id").split("-")
+                        val_timestamp = int(val_id[0])
+                        val_seq = int(val_id[1])
+
+                        if (val_timestamp > start_timestamp or (val_timestamp == start_timestamp and val_seq >= start_seq)):
+                            res.append(val)
+                    
+                    if res:
+                        result.append([key, res])
+                
+                if result or block_ms is None:
+                    break
+
+                if block_ms is not None and block_ms > 0:
+                    elapsed = (datetime.now() - start_time).total_seconds() * 1000
+                    if elapsed >= block_ms:
+                        break
+                
+                await asyncio.sleep(0.1)
+            
+            resp = f"*{len(result)}\r\n"
+            for stream_data in result:
+                key, items = stream_data
+                resp += f"*2\r\n${len(key)}\r\n{key}\r\n"
+                resp += f"*{len(items)}\r\n"
+                
+                for item in items:
+                    resp += f"*2\r\n${len(item['id'])}\r\n{item['id']}\r\n"
+                    field_count = len(item) - 1
+                    resp += f"*{field_count * 2}\r\n"
+                    for field_key, field_value in item.items():
+                        if field_key != 'id':
+                            resp += f"${len(field_key)}\r\n{field_key}\r\n${len(field_value)}\r\n{field_value}\r\n"
+            
+            return resp if result else "*0\r\n"
         else:
             return EMPTY_RES
              
@@ -145,19 +286,63 @@ class RedisServer:
         elif "SET" in command and ("EX" not in command or "PX" not in command):
             if len(split_command) != 3:
                 return "Missing parameters"
-        elif "GET" in command or "LLEN" in command or "ECHO" in command:
+        elif "GET" in command or "LLEN" in command or "ECHO" in command or "TYPE" in command:
             if len(split_command) != 2:
                 return "Missing parameters"
-        elif "RPUSH" in command or "LPUSH" in command  or "LPOP" in command or "BLPOP" in command:
+        elif "RPUSH" in command or "LPUSH" in command  or "LPOP" in command or "BLPOP" in command or "XADD" in command or "XRANGE" in command:
             if len(split_command) < 3:
                 return "Missing parameters"
         elif "LRANGE" in command:
             if len(split_command) != 4:
                 return "Missing parameters"
+        elif "XREAD" in command:
+            if "STREAMS" not in split_command:
+                return "Missing STREAMS keyword"
+            streams_idx = split_command.index("STREAMS")
+            num_keys = (len(split_command) - streams_idx - 1) // 2
+            if num_keys == 0:
+                return "Missing keys and IDs"
         else:
             return "Not valid command"
         
         return False
+
+    def validate_stream_id(self, command: str):
+        split_command = command.split()
+        curr_split_id = split_command[2].split('-')
+        value = self.map.get(split_command[1], None)
+        
+        def generate_id(curr_id, timestamp, last_id=None):
+            if len(curr_id) == 1 and curr_id[0] == "*":
+                return f"{timestamp}-1"
+            elif len(curr_id) == 2:
+                first = timestamp if curr_id[0] == "*" else int(curr_id[0])
+                if curr_id[1] == "*":
+                    if last_id and int(last_id[0]) == first:
+                        second = int(last_id[1]) + 1
+                    else:
+                        second = 1
+                else:
+                    second = int(curr_id[1])
+                return f"{first}-{second}"
+            else:
+                return split_command[2]
+        
+        timestamp = datetime.now().microsecond // 1000
+        
+        if value is None:
+            return generate_id(curr_split_id, timestamp)
+        
+        sorted_val = sorted(value, key=lambda val: val.get("id"))
+        last_id = sorted_val[-1].get("id", "").split('-')
+        
+        new_id = generate_id(curr_split_id, timestamp, last_id).split('-')
+        
+        if int(new_id[0]) < int(last_id[0]) or \
+        (int(new_id[0]) == int(last_id[0]) and int(new_id[1]) <= int(last_id[1])):
+            return False
+        
+        return generate_id(curr_split_id, timestamp, last_id)
 
     async def start(self):
         server = await asyncio.start_server(self.handleTask, self.host, self.port)
@@ -165,4 +350,10 @@ class RedisServer:
 
 if __name__ == "__main__":
     redis_server = RedisServer()
-    asyncio.run(redis_server.start())
+    try:
+        asyncio.run(redis_server.start())
+    except KeyboardInterrupt:
+        pass
+
+
+# TODO: RESP parser, command validator
