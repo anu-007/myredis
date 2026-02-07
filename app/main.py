@@ -10,13 +10,15 @@ class RedisServer:
         self.map = {}
     
     async def handleTask(self, reader:asyncio.StreamReader, writer:asyncio.StreamWriter):
+        queue = []
+        transaction = False
         try:
             while True:
                 data = await reader.read(1024)
                 if not data:
                     break
 
-                response = await self.process_command(data.decode())
+                response = await self.process_command(data.decode(), transaction, queue)
                 if response:
                     writer.write(response.encode())
                     writer.close()
@@ -30,11 +32,15 @@ class RedisServer:
             writer.close()
             await writer.wait_closed()
     
-    async def process_command(self, command: str):
+    async def process_command(self, command: str, transaction: bool, queue: list):
         issue = self.validate_command(command)
 
         if issue:
             return issue
+
+        if transaction:
+            queue.append(command)
+            return "QUEUED\r\n"
 
         split_cmd = command.split()
         if "PING" in command:
@@ -271,13 +277,42 @@ class RedisServer:
                             resp += f"${len(field_key)}\r\n{field_key}\r\n${len(field_value)}\r\n{field_value}\r\n"
             
             return resp if result else "*0\r\n"
+        elif "INCR" in command:
+            if split_cmd[1] not in self.map:
+                self.map[split_cmd[1]] = 1
+            elif split_cmd[1] in self.map and isinstance(self.map[split_cmd[1]], int):
+                self.map[split_cmd[1]] = int(self.map[split_cmd[1]]) + 1
+            else:
+                return "(error) ERR value is not an integer or out of range\r\n"
+            
+            return f"{self.map[split_cmd[1]]}\r\n"
+        elif "MULTI" in command:
+            transaction = True
+            return "OK\r\n"
+        elif "EXEC" in command:
+            if not transaction:
+                return "(error) ERR EXEC without MULTI\r\n"
+
+            transaction = False
+            result = []
+            for command in queue:
+                result.append(await self.process_command(command, transaction=False, queue=[]))
+            queue = []
+            return result
+        elif "DISCARD" in command:
+            if not transaction:
+                return "(error) ERR DISCARD without MULTI\r\n"
+
+            transaction = False
+            queue = []
+            return "OK\r\n"
         else:
             return EMPTY_RES
              
     def validate_command(self, command: str):
         split_command = command.split()
 
-        if "PING" in command:
+        if "PING" in command or "MULTI" in command or "EXEC" in command or "DISCARD" in command:
             if len(split_command) != 1:
                 return "Missing parameters"
         elif "SET" in command and ("EX" in command or "PX" in command):
@@ -286,7 +321,7 @@ class RedisServer:
         elif "SET" in command and ("EX" not in command or "PX" not in command):
             if len(split_command) != 3:
                 return "Missing parameters"
-        elif "GET" in command or "LLEN" in command or "ECHO" in command or "TYPE" in command:
+        elif "GET" in command or "LLEN" in command or "ECHO" in command or "TYPE" in command or "INCR" in command:
             if len(split_command) != 2:
                 return "Missing parameters"
         elif "RPUSH" in command or "LPUSH" in command  or "LPOP" in command or "BLPOP" in command or "XADD" in command or "XRANGE" in command:
