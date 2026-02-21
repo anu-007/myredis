@@ -1,14 +1,94 @@
 import asyncio
+import argparse
 from datetime import datetime, timedelta
 
 EMPTY_RES = "$-1\r\n"
 
 class RedisServer:
-    def __init__(self, host="localhost", port=6378):
+    def __init__(self, host="localhost", port=6378, replica_of=None):
         self.host = host
         self.port = port
         self.map = {}
-    
+        self.role = "master" if replica_of is None else "replica"
+        self.replication_id = "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb"
+        self.replication_offset = 0
+        self.master_reader = None
+        self.master_writer = None
+        self.replicas = []
+        self.replica_of = replica_of
+        self.replica_acks = {}  # Track ACKs from replicas: {writer: offset}
+
+    async def send(self, writer, cmd):
+        writer.write((cmd + "\r\n").encode())
+        await writer.drain()
+
+    async def read(self, reader):
+        data = await reader.read(1024)
+        return data.decode()
+
+    async def propagate_to_replicas(self, cmd):
+        if self.role == "master":
+            # Update replication offset
+            self.replication_offset += len(cmd) + 2  # +2 for \r\n
+
+            for replica in self.replicas:
+                replica.write((cmd + "\r\n").encode())
+                await replica.drain()
+
+    async def receive_replication(self):
+        while True:
+            data = await self.master_reader.read(1024)
+            if not data:
+                break
+
+            # Process commands from master
+            commands = data.decode().strip().split('\r\n')
+            for cmd in commands:
+                if cmd:
+                    print("Replication command:", cmd)
+                    # Process the command (this will update replication_offset)
+                    await self.process_command(cmd, transaction=False, queue=[], writer=self.master_writer)
+
+    async def connect_to_master(self):
+        host, port = self.replica_of.split(":")
+        port = int(port)
+
+        print(f"Connecting to master {host}:{port}")
+
+        reader, writer = await asyncio.open_connection(host, port)
+
+        self.master_reader = reader
+        self.master_writer = writer
+
+        await self.send(writer, "PING")
+        print(await self.read(reader))
+
+        await self.send(writer, f"REPLCONF listening-port {self.port}")
+        print(await self.read(reader))
+
+        await self.send(writer, "REPLCONF capa psync2")
+        print(await self.read(reader))
+
+        await self.send(writer, "PSYNC ? -1")
+
+        # Read FULLRESYNC response
+        fullresync_response = await reader.readline()
+        print("PSYNC response:", fullresync_response.decode())
+
+        # Read RDB file
+        # First read the bulk string length: $<length>\r\n
+        rdb_length_line = await reader.readline()
+        print("RDB length line:", rdb_length_line.decode().strip())
+
+        # Parse the length
+        if rdb_length_line.startswith(b'$'):
+            rdb_length = int(rdb_length_line[1:].strip())
+            # Read the exact number of bytes for the RDB file
+            rdb_data = await reader.readexactly(rdb_length)
+            print(f"Received RDB file: {len(rdb_data)} bytes")
+
+        asyncio.create_task(self.receive_replication())
+
     async def handleTask(self, reader:asyncio.StreamReader, writer:asyncio.StreamWriter):
         queue = []
         transaction = False
@@ -18,10 +98,10 @@ class RedisServer:
                 if not data:
                     break
 
-                response = await self.process_command(data.decode(), transaction, queue)
+                response = await self.process_command(data.decode(), transaction, queue, writer)
                 if response:
                     writer.write(response.encode())
-                    writer.close()
+                    await writer.drain()  # Flush the buffer but keep connection open
             print(self.map)
         except (asyncio.CancelledError, KeyboardInterrupt):
             pass
@@ -32,7 +112,7 @@ class RedisServer:
             writer.close()
             await writer.wait_closed()
     
-    async def process_command(self, command: str, transaction: bool, queue: list):
+    async def process_command(self, command: str, transaction: bool, queue: list, writer: asyncio.StreamWriter = None):
         issue = self.validate_command(command)
 
         if issue:
@@ -58,6 +138,7 @@ class RedisServer:
                 value_obj["exp"] = -1
             
             self.map[key] = value_obj
+            await self.propagate_to_replicas(command)
             return "OK\r\n"
         elif "GET" in command:
             if split_cmd[1] in self.map:
@@ -296,7 +377,7 @@ class RedisServer:
             transaction = False
             result = []
             for command in queue:
-                result.append(await self.process_command(command, transaction=False, queue=[]))
+                result.append(await self.process_command(command, transaction=False, queue=[], writer=writer))
             queue = []
             return result
         elif "DISCARD" in command:
@@ -306,13 +387,93 @@ class RedisServer:
             transaction = False
             queue = []
             return "OK\r\n"
+        elif "INFO" in command:
+            if self.replica_of is None:
+                return f"# Replication\r\nrole:master\r\nmaster_replid:{self.replication_id}\r\nmaster_repl_offset:{self.replication_offset}\r\n"
+            else:
+                return "# Replication\r\nrole:slave\r\n"
+        elif "REPLCONF" in command:
+            if self.role == "replica" and "GETACK" in command:
+                return f"*3\r\n$8\r\nREPLCONF\r\n$3\r\nACK\r\n${len(str(self.replication_offset))}\r\n{self.replication_offset}\r\n"
+            elif self.role == "master" and "ACK" in command:
+                # Replica is acknowledging replication offset
+                if writer and len(split_cmd) >= 3:
+                    offset = int(split_cmd[2])
+                    self.replica_acks[writer] = offset
+                return None  # Don't send response to ACK
+            elif self.role == "master" and "GETACK" in command:
+                await self.propagate_to_replicas(command)
+                return None  # Don't send response, wait for ACKs
+            else:
+                return "+OK\r\n"
+        elif "PSYNC" in command:
+            if writer:
+                self.replicas.append(writer)
+                # Send FULLRESYNC response
+                response = f"+FULLRESYNC {self.replication_id} {self.replication_offset}\r\n"
+                writer.write(response.encode())
+                await writer.drain()
+
+                # Send empty RDB file (minimal valid RDB)
+                # RDB file format: REDIS<version><databases><EOF>
+                empty_rdb = bytes.fromhex(
+                    "524544495330303131"  # "REDIS0011" - RDB version 11
+                    "fa0972656469732d76657205372e322e30"  # Redis version metadata
+                    "fa0a72656469732d62697473c040"  # Redis bits metadata
+                    "fa056374696d65c26d08bc65"  # Creation time metadata
+                    "fa08757365642d6d656dc2b0c41000"  # Used memory metadata
+                    "fa08616f662d62617365c000"  # AOF base metadata
+                    "ff"  # EOF marker
+                    "f06e3bfec0ff5aa2"  # CRC64 checksum
+                )
+                writer.write(f"${len(empty_rdb)}\r\n".encode())
+                writer.write(empty_rdb)
+                await writer.drain()
+            return None  # Don't send additional response
+        elif "WAIT" in command:
+            num_replicas = int(split_cmd[1])
+            timeout_ms = int(split_cmd[2])
+
+            # If no replicas connected, return 0
+            if len(self.replicas) == 0:
+                return ":0\r\n"
+
+            # If no writes have been made (offset is 0), all replicas are in sync
+            if self.replication_offset == 0:
+                return f":{len(self.replicas)}\r\n"
+
+            # Send REPLCONF GETACK * to all replicas
+            getack_cmd = "REPLCONF GETACK *"
+            for replica in self.replicas:
+                replica.write((getack_cmd + "\r\n").encode())
+                await replica.drain()
+
+            # Wait for ACKs from replicas
+            start_time = datetime.now()
+            ack_count = 0
+
+            while True:
+                # Count how many replicas have acknowledged
+                ack_count = sum(1 for offset in self.replica_acks.values() if offset >= self.replication_offset)
+
+                # If we have enough ACKs, return
+                if ack_count >= num_replicas:
+                    return f":{ack_count}\r\n"
+
+                # Check timeout
+                elapsed_ms = (datetime.now() - start_time).total_seconds() * 1000
+                if elapsed_ms >= timeout_ms:
+                    return f":{ack_count}\r\n"
+
+                # Wait a bit before checking again
+                await asyncio.sleep(0.01)
         else:
             return EMPTY_RES
              
     def validate_command(self, command: str):
         split_command = command.split()
 
-        if "PING" in command or "MULTI" in command or "EXEC" in command or "DISCARD" in command:
+        if "PING" in command or "MULTI" in command or "EXEC" in command or "DISCARD" in command or "INFO" in command:
             if len(split_command) != 1:
                 return "Missing parameters"
         elif "SET" in command and ("EX" in command or "PX" in command):
@@ -324,11 +485,14 @@ class RedisServer:
         elif "GET" in command or "LLEN" in command or "ECHO" in command or "TYPE" in command or "INCR" in command:
             if len(split_command) != 2:
                 return "Missing parameters"
-        elif "RPUSH" in command or "LPUSH" in command  or "LPOP" in command or "BLPOP" in command or "XADD" in command or "XRANGE" in command:
+        elif "RPUSH" in command or "LPUSH" in command  or "LPOP" in command or "BLPOP" in command or "XADD" in command or "XRANGE" in command or "REPLCONF" in command or "PSYNC" in command:
             if len(split_command) < 3:
                 return "Missing parameters"
         elif "LRANGE" in command:
             if len(split_command) != 4:
+                return "Missing parameters"
+        elif "WAIT" in command:
+            if len(split_command) != 3:
                 return "Missing parameters"
         elif "XREAD" in command:
             if "STREAMS" not in split_command:
@@ -381,14 +545,23 @@ class RedisServer:
 
     async def start(self):
         server = await asyncio.start_server(self.handleTask, self.host, self.port)
-        await server.serve_forever()
+        print(f"Redis running on {self.host}:{self.port} as {self.role}")
+
+        # start handshake if replica
+        if self.role == "replica":
+            asyncio.create_task(self.connect_to_master())
+
+        async with server:
+            await server.serve_forever()
 
 if __name__ == "__main__":
-    redis_server = RedisServer()
+    parser = argparse.ArgumentParser(description='Redis Server')
+    parser.add_argument('--port', type=int, default=6378, help='Port to run the server on (default: 6379)')
+    parser.add_argument('--replica-of', type=str, default=None, help='Master server to replicate from (default: None)')
+    args = parser.parse_args()
+
+    redis_server = RedisServer(port=args.port, replica_of=args.replica_of)
     try:
         asyncio.run(redis_server.start())
     except KeyboardInterrupt:
         pass
-
-
-# TODO: RESP parser, command validator
