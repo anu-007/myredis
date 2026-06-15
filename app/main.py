@@ -1,11 +1,12 @@
 import asyncio
 import argparse
+import os
 from datetime import datetime, timedelta
 
 EMPTY_RES = "$-1\r\n"
 
 class RedisServer:
-    def __init__(self, host="localhost", port=6378, replica_of=None):
+    def __init__(self, host="localhost", port=6378, replica_of=None, dir="/tmp/redis-data", dbfilename="dump.rdb"):
         self.host = host
         self.port = port
         self.map = {}
@@ -16,7 +17,10 @@ class RedisServer:
         self.master_writer = None
         self.replicas = []
         self.replica_of = replica_of
-        self.replica_acks = {}  # Track ACKs from replicas: {writer: offset}
+        self.replica_acks = {}
+        self.dir = dir
+        self.dbfile_name = dbfilename
+        self.load_rdb()
 
     async def send(self, writer, cmd):
         writer.write((cmd + "\r\n").encode())
@@ -94,14 +98,27 @@ class RedisServer:
         transaction = False
         try:
             while True:
-                data = await reader.read(1024)
-                if not data:
+                line = await reader.readline()
+                if not line:
                     break
 
-                response = await self.process_command(data.decode(), transaction, queue, writer)
+                if line.startswith(b'*'):
+                    # RESP array
+                    count = int(line[1:].rstrip(b'\r\n'))
+                    parts = []
+                    for _ in range(count):
+                        length_line = await reader.readline()
+                        length = int(length_line[1:].rstrip(b'\r\n'))
+                        data = await reader.readexactly(length + 2)
+                        parts.append(data[:length].decode())
+                    command = ' '.join(parts)
+                else:
+                    command = line.decode().strip()
+
+                response = await self.process_command(command, transaction, queue, writer)
                 if response:
                     writer.write(response.encode())
-                    await writer.drain()  # Flush the buffer but keep connection open
+                    await writer.drain()
             print(self.map)
         except (asyncio.CancelledError, KeyboardInterrupt):
             pass
@@ -123,11 +140,14 @@ class RedisServer:
             return "QUEUED\r\n"
 
         split_cmd = command.split()
-        if "PING" in command:
+        if not split_cmd:
+            return EMPTY_RES
+        if split_cmd[0] == "PING":
             return "+PONG\r\n"
-        elif "ECHO" in command:
-            return command.split()[1]
-        elif "SET" in command:
+        elif split_cmd[0] == "ECHO":
+            val = split_cmd[1]
+            return f"${len(val)}\r\n{val}\r\n"
+        elif split_cmd[0] == "SET":
             key = split_cmd[1]
             value_obj = {"val": split_cmd[2], "exp": -1}
             if "EX" in split_cmd:
@@ -136,34 +156,35 @@ class RedisServer:
                 value_obj["exp"] = datetime.now() + timedelta(milliseconds=int(split_cmd[4]))
             else:
                 value_obj["exp"] = -1
-            
+
             self.map[key] = value_obj
             await self.propagate_to_replicas(command)
-            return "OK\r\n"
-        elif "GET" in command:
+            return "+OK\r\n"
+        elif split_cmd[0] == "GET":
             if split_cmd[1] in self.map:
                 value_obj = self.map[split_cmd[1]]
 
                 if isinstance(value_obj, list):
-                    return f"{value_obj}\r\n"
+                    return "-ERR wrong kind of value\r\n"
                 if value_obj.get("exp", -1) != -1 and datetime.now() > value_obj.get("exp"):
                     return EMPTY_RES
                 else:
-                    return f"{value_obj.get("val")}\r\n"
+                    val = value_obj.get("val")
+                    return f"${len(val)}\r\n{val}\r\n"
             else:
                 return EMPTY_RES
-        elif "RPUSH" in command or "LPUSH" in command:
+        elif split_cmd[0] in ("RPUSH", "LPUSH"):
             for idx in range(2, len(split_cmd)):
                 if split_cmd[1] not in self.map:
                     self.map[split_cmd[1]] = [split_cmd[idx]]
                 else:
-                    if "RPUSH" in command:
+                    if split_cmd[0] == "RPUSH":
                         self.map[split_cmd[1]].append(split_cmd[idx])
                     else:
                         self.map[split_cmd[1]] = [split_cmd[idx]] + self.map.get(split_cmd[1], [])
 
-            return f"{len(self.map[split_cmd[1]])}\r\n"
-        elif "LRANGE" in command:
+            return f":{len(self.map[split_cmd[1]])}\r\n"
+        elif split_cmd[0] == "LRANGE":
             value_list = self.map.get(split_cmd[1], [])
             value_list_len = len(value_list)
             lb = int(split_cmd[2]) if int(split_cmd[2]) >= 0 else value_list_len + int(split_cmd[2]) + 1
@@ -179,10 +200,10 @@ class RedisServer:
             for item in result:
                 resp += f"${len(item)}\r\n{item}\r\n"
             return resp
-        elif "LLEN" in command:
+        elif split_cmd[0] == "LLEN":
             value_list = self.map.get(split_cmd[1], [])
-            return f"{len(value_list)}\r\n"
-        elif "LPOP" in command:
+            return f":{len(value_list)}\r\n"
+        elif split_cmd[0] == "LPOP":
             value_list = self.map.get(split_cmd[1], [])
             elem_removed = []
             for _ in range(int(split_cmd[2])):
@@ -195,7 +216,7 @@ class RedisServer:
             for item in elem_removed:
                 resp += f"${len(item)}\r\n{item}\r\n"
             return resp
-        elif "BLPOP" in command:
+        elif split_cmd[0] == "BLPOP":
             value_list = self.map.get(split_cmd[1], [])
             value_list_len = len(value_list)
 
@@ -221,23 +242,23 @@ class RedisServer:
                 return f"*2\r\n${len(split_cmd[1])}\r\n{split_cmd[1]}\r\n${len(el)}\r\n{el}\r\n"
             else:
                 return EMPTY_RES
-        elif "TYPE" in command:
+        elif split_cmd[0] == "TYPE":
             value = self.map.get(split_cmd[1], None)
             if value is None:
-                return "none\r\n"
+                return "+none\r\n"
             elif isinstance(value, list):
                 if isinstance(value[0], dict) and value[0].get("id", None):
-                    return "stream\r\n"
-                return "list\r\n"
+                    return "+stream\r\n"
+                return "+list\r\n"
             elif isinstance(value, dict) and "val" in value:
-                return "string\r\n"
+                return "+string\r\n"
             else:
-                return "none\r\n"
-        elif "XADD" in command:
+                return "+none\r\n"
+        elif split_cmd[0] == "XADD":
             key = split_cmd[1]
             valid_id = self.validate_stream_id(command)
             if not valid_id:
-                return "(error) ERR The ID specified in XADD is equal or smaller than the target stream top item"
+                return "-ERR The ID specified in XADD is equal or smaller than the target stream top item\r\n"
 
             value = self.map.get(key, [])
             curr_obj = { "id": valid_id }
@@ -246,8 +267,8 @@ class RedisServer:
 
             value.append(curr_obj)
             self.map[key] = value
-            return f"{len(valid_id)}\r\n{valid_id}\r\n"
-        elif "XRANGE" in command:
+            return f"${len(valid_id)}\r\n{valid_id}\r\n"
+        elif split_cmd[0] == "XRANGE":
             values = self.map.get(split_cmd[1], [])
             if values is None:
                 return "*0\r\n"
@@ -289,7 +310,7 @@ class RedisServer:
                     if key != 'id':
                         resp += f"${len(key)}\r\n{key}\r\n${len(value)}\r\n{value}\r\n"
             return resp
-        elif "XREAD" in command:
+        elif split_cmd[0] == "XREAD":
             block_ms = None
             streams_idx = split_cmd.index("STREAMS")
 
@@ -358,41 +379,45 @@ class RedisServer:
                             resp += f"${len(field_key)}\r\n{field_key}\r\n${len(field_value)}\r\n{field_value}\r\n"
             
             return resp if result else "*0\r\n"
-        elif "INCR" in command:
+        elif split_cmd[0] == "INCR":
             if split_cmd[1] not in self.map:
                 self.map[split_cmd[1]] = 1
             elif split_cmd[1] in self.map and isinstance(self.map[split_cmd[1]], int):
                 self.map[split_cmd[1]] = int(self.map[split_cmd[1]]) + 1
             else:
-                return "(error) ERR value is not an integer or out of range\r\n"
-            
-            return f"{self.map[split_cmd[1]]}\r\n"
-        elif "MULTI" in command:
+                return "-ERR value is not an integer or out of range\r\n"
+
+            return f":{self.map[split_cmd[1]]}\r\n"
+        elif split_cmd[0] == "MULTI":
             transaction = True
-            return "OK\r\n"
-        elif "EXEC" in command:
+            return "+OK\r\n"
+        elif split_cmd[0] == "EXEC":
             if not transaction:
-                return "(error) ERR EXEC without MULTI\r\n"
+                return "-ERR EXEC without MULTI\r\n"
 
             transaction = False
             result = []
             for command in queue:
                 result.append(await self.process_command(command, transaction=False, queue=[], writer=writer))
             queue = []
-            return result
-        elif "DISCARD" in command:
+            resp = f"*{len(result)}\r\n"
+            for item in result:
+                resp += item
+            return resp
+        elif split_cmd[0] == "DISCARD":
             if not transaction:
-                return "(error) ERR DISCARD without MULTI\r\n"
+                return "-ERR DISCARD without MULTI\r\n"
 
             transaction = False
             queue = []
-            return "OK\r\n"
-        elif "INFO" in command:
+            return "+OK\r\n"
+        elif split_cmd[0] == "INFO":
             if self.replica_of is None:
-                return f"# Replication\r\nrole:master\r\nmaster_replid:{self.replication_id}\r\nmaster_repl_offset:{self.replication_offset}\r\n"
+                info = f"# Replication\r\nrole:master\r\nmaster_replid:{self.replication_id}\r\nmaster_repl_offset:{self.replication_offset}\r\n"
             else:
-                return "# Replication\r\nrole:slave\r\n"
-        elif "REPLCONF" in command:
+                info = "# Replication\r\nrole:slave\r\n"
+            return f"${len(info)}\r\n{info}\r\n"
+        elif split_cmd[0] == "REPLCONF":
             if self.role == "replica" and "GETACK" in command:
                 return f"*3\r\n$8\r\nREPLCONF\r\n$3\r\nACK\r\n${len(str(self.replication_offset))}\r\n{self.replication_offset}\r\n"
             elif self.role == "master" and "ACK" in command:
@@ -406,7 +431,7 @@ class RedisServer:
                 return None  # Don't send response, wait for ACKs
             else:
                 return "+OK\r\n"
-        elif "PSYNC" in command:
+        elif split_cmd[0] == "PSYNC":
             if writer:
                 self.replicas.append(writer)
                 # Send FULLRESYNC response
@@ -430,7 +455,7 @@ class RedisServer:
                 writer.write(empty_rdb)
                 await writer.drain()
             return None  # Don't send additional response
-        elif "WAIT" in command:
+        elif split_cmd[0] == "WAIT":
             num_replicas = int(split_cmd[1])
             timeout_ms = int(split_cmd[2])
 
@@ -467,42 +492,56 @@ class RedisServer:
 
                 # Wait a bit before checking again
                 await asyncio.sleep(0.01)
+        elif split_cmd[0] == "CONFIG":
+            if split_cmd[1] == 'GET':
+                result = []
+                for i in range(2, len(split_cmd)):
+                    if split_cmd[i] == 'dir':
+                        result.append(('dir', self.dir))
+                    elif split_cmd[i] == 'dbfilename':
+                        result.append(('dbfilename', self.dbfile_name))
+                resp = f"*{len(result) * 2}\r\n"
+                for key, value in result:
+                    resp += f"${len(key)}\r\n{key}\r\n${len(value)}\r\n{value}\r\n"
+                return resp
+            else:
+                return EMPTY_RES
         else:
             return EMPTY_RES
              
     def validate_command(self, command: str):
         split_command = command.split()
 
-        if "PING" in command or "MULTI" in command or "EXEC" in command or "DISCARD" in command or "INFO" in command:
+        if split_command[0] in ("PING", "MULTI", "EXEC", "DISCARD", "INFO"):
             if len(split_command) != 1:
-                return "Missing parameters"
-        elif "SET" in command and ("EX" in command or "PX" in command):
+                return "-ERR Missing parameters\r\n"
+        elif split_command[0] == "SET" and ("EX" in split_command or "PX" in split_command):
             if len(split_command) != 5:
-                return "Missing parameters"
-        elif "SET" in command and ("EX" not in command or "PX" not in command):
+                return "-ERR Missing parameters\r\n"
+        elif split_command[0] == "SET" and "EX" not in split_command and "PX" not in split_command:
             if len(split_command) != 3:
-                return "Missing parameters"
-        elif "GET" in command or "LLEN" in command or "ECHO" in command or "TYPE" in command or "INCR" in command:
+                return "-ERR Missing parameters\r\n"
+        elif split_command[0] in ("GET", "LLEN", "ECHO", "TYPE", "INCR"):
             if len(split_command) != 2:
-                return "Missing parameters"
-        elif "RPUSH" in command or "LPUSH" in command  or "LPOP" in command or "BLPOP" in command or "XADD" in command or "XRANGE" in command or "REPLCONF" in command or "PSYNC" in command:
+                return "-ERR Missing parameters\r\n"
+        elif split_command[0] in ("RPUSH", "LPUSH", "LPOP", "BLPOP", "XADD", "XRANGE", "REPLCONF", "PSYNC", "CONFIG"):
             if len(split_command) < 3:
-                return "Missing parameters"
-        elif "LRANGE" in command:
+                return "-ERR Missing parameters\r\n"
+        elif split_command[0] == "LRANGE":
             if len(split_command) != 4:
-                return "Missing parameters"
-        elif "WAIT" in command:
+                return "-ERR Missing parameters\r\n"
+        elif split_command[0] == "WAIT":
             if len(split_command) != 3:
-                return "Missing parameters"
-        elif "XREAD" in command:
+                return "-ERR Missing parameters\r\n"
+        elif split_command[0] == "XREAD":
             if "STREAMS" not in split_command:
-                return "Missing STREAMS keyword"
+                return "-ERR Missing STREAMS keyword\r\n"
             streams_idx = split_command.index("STREAMS")
             num_keys = (len(split_command) - streams_idx - 1) // 2
             if num_keys == 0:
-                return "Missing keys and IDs"
+                return "-ERR Missing keys and IDs\r\n"
         else:
-            return "Not valid command"
+            return "-ERR Not valid command\r\n"
         
         return False
 
@@ -543,6 +582,131 @@ class RedisServer:
         
         return generate_id(curr_split_id, timestamp, last_id)
 
+    def load_rdb(self):
+        rdb_path = os.path.join(self.dir, self.dbfile_name)
+        if not os.path.exists(rdb_path):
+            return
+        try:
+            with open(rdb_path, 'rb') as f:
+                self.parse_rdb(f.read())
+        except Exception as e:
+            print(f"Error loading RDB: {e}")
+
+    def _read_length_encoded_integer(self, data: bytes, idx: int):
+        """Read a length-encoded integer from data at idx. Returns (value, new_idx)."""
+        byte = data[idx]
+        prefix = (byte >> 6) & 0x03
+        if prefix == 0:
+            return byte & 0x3F, idx + 1
+        elif prefix == 1:
+            value = ((byte & 0x3F) << 8) | data[idx + 1]
+            return value, idx + 2
+        elif prefix == 2:
+            value = int.from_bytes(data[idx + 1:idx + 5], byteorder='big')
+            return value, idx + 5
+        else:
+            # Special encoding - shouldn't happen for lengths
+            return 0, idx + 1
+
+    def _read_length_encoded_string(self, data: bytes, idx: int):
+        """Read a length-encoded string from data at idx. Returns (string, new_idx)."""
+        byte = data[idx]
+        prefix = (byte >> 6) & 0x03
+        if prefix == 0:
+            length = byte & 0x3F
+            return data[idx + 1:idx + 1 + length].decode(), idx + 1 + length
+        elif prefix == 1:
+            length = ((byte & 0x3F) << 8) | data[idx + 1]
+            return data[idx + 2:idx + 2 + length].decode(), idx + 2 + length
+        elif prefix == 2:
+            length = int.from_bytes(data[idx + 1:idx + 5], byteorder='big')
+            return data[idx + 5:idx + 5 + length].decode(), idx + 5 + length
+        else:
+            # Special encoding
+            enc_type = byte & 0x3F
+            if enc_type == 0:
+                value = int.from_bytes(data[idx + 1:idx + 2], byteorder='little', signed=True)
+                return str(value), idx + 2
+            elif enc_type == 1:
+                value = int.from_bytes(data[idx + 1:idx + 3], byteorder='little', signed=True)
+                return str(value), idx + 3
+            elif enc_type == 2:
+                value = int.from_bytes(data[idx + 1:idx + 5], byteorder='little', signed=True)
+                return str(value), idx + 5
+            else:
+                # Skip unknown special encoding
+                return "", idx + 1
+
+    def parse_rdb(self, data: bytes):
+        """Parse RDB file data and populate self.map."""
+        if len(data) < 9 or not data.startswith(b'REDIS'):
+            return
+
+        idx = 9  # Skip "REDIS" + 4 bytes version
+
+        while idx < len(data):
+            byte = data[idx]
+
+            if byte == 0xFA:
+                # Metadata
+                idx += 1
+                key, idx = self._read_length_encoded_string(data, idx)
+                value, idx = self._read_length_encoded_string(data, idx)
+
+            elif byte == 0xFE:
+                # Database selector
+                idx += 1
+                db_index, idx = self._read_length_encoded_integer(data, idx)
+
+            elif byte == 0xFB:
+                # Hash table size info
+                idx += 1
+                ht_size, idx = self._read_length_encoded_integer(data, idx)
+                expire_ht_size, idx = self._read_length_encoded_integer(data, idx)
+
+            elif byte == 0xFC:
+                # Expiry in milliseconds (8 bytes, little-endian)
+                idx += 1
+                expiry_ms = int.from_bytes(data[idx:idx + 8], byteorder='little')
+                idx += 8
+                expiry = datetime.fromtimestamp(expiry_ms / 1000)
+                val_type = data[idx]
+                idx += 1
+                if val_type == 0x00:
+                    key, idx = self._read_length_encoded_string(data, idx)
+                    value, idx = self._read_length_encoded_string(data, idx)
+                    if datetime.now() < expiry:
+                        self.map[key] = {"val": value, "exp": expiry}
+
+            elif byte == 0xFD:
+                # Expiry in seconds (4 bytes, little-endian)
+                idx += 1
+                expiry_s = int.from_bytes(data[idx:idx + 4], byteorder='little')
+                idx += 4
+                expiry = datetime.fromtimestamp(expiry_s)
+                val_type = data[idx]
+                idx += 1
+                if val_type == 0x00:
+                    key, idx = self._read_length_encoded_string(data, idx)
+                    value, idx = self._read_length_encoded_string(data, idx)
+                    if datetime.now() < expiry:
+                        self.map[key] = {"val": value, "exp": expiry}
+
+            elif byte == 0xFF:
+                # End of file
+                break
+
+            elif byte == 0x00:
+                # String type
+                idx += 1
+                key, idx = self._read_length_encoded_string(data, idx)
+                value, idx = self._read_length_encoded_string(data, idx)
+                self.map[key] = {"val": value, "exp": -1}
+
+            else:
+                # Unknown type - skip to avoid infinite loop
+                idx += 1
+
     async def start(self):
         server = await asyncio.start_server(self.handleTask, self.host, self.port)
         print(f"Redis running on {self.host}:{self.port} as {self.role}")
@@ -558,9 +722,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Redis Server')
     parser.add_argument('--port', type=int, default=6378, help='Port to run the server on (default: 6379)')
     parser.add_argument('--replica-of', type=str, default=None, help='Master server to replicate from (default: None)')
+    parser.add_argument('--dir', type=str, default='/tmp/redis-data', help='Directory for RDB files')
+    parser.add_argument('--dbfilename', type=str, default='dump.rdb', help='RDB filename')
     args = parser.parse_args()
 
-    redis_server = RedisServer(port=args.port, replica_of=args.replica_of)
+    redis_server = RedisServer(port=args.port, replica_of=args.replica_of, dir=args.dir, dbfilename=args.dbfilename)
     try:
         asyncio.run(redis_server.start())
     except KeyboardInterrupt:
