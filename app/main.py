@@ -21,6 +21,7 @@ class RedisServer:
         self.dir = dir
         self.dbfile_name = dbfilename
         self.load_rdb()
+        self.channels = {}
 
     async def send(self, writer, cmd):
         writer.write((cmd + "\r\n").encode())
@@ -96,6 +97,7 @@ class RedisServer:
     async def handleTask(self, reader:asyncio.StreamReader, writer:asyncio.StreamWriter):
         queue = []
         transaction = False
+        subscribed_channels = set()
         try:
             while True:
                 line = await reader.readline()
@@ -115,7 +117,7 @@ class RedisServer:
                 else:
                     command = line.decode().strip()
 
-                response = await self.process_command(command, transaction, queue, writer)
+                response = await self.process_command(command, transaction, queue, writer, subscribed_channels)
                 if response:
                     writer.write(response.encode())
                     await writer.drain()
@@ -126,10 +128,13 @@ class RedisServer:
             if not isinstance(e, (ConnectionResetError, BrokenPipeError)):
                 print(e)
         finally:
+            for ch in list(subscribed_channels):
+                if ch in self.channels and writer in self.channels[ch]:
+                    self.channels[ch].remove(writer)
             writer.close()
             await writer.wait_closed()
     
-    async def process_command(self, command: str, transaction: bool, queue: list, writer: asyncio.StreamWriter = None):
+    async def process_command(self, command: str, transaction: bool, queue: list, writer: asyncio.StreamWriter = None, subscribed_channels: set = None):
         issue = self.validate_command(command)
 
         if issue:
@@ -142,6 +147,8 @@ class RedisServer:
         split_cmd = command.split()
         if not split_cmd:
             return EMPTY_RES
+        if subscribed_channels and split_cmd[0] not in ("SUBSCRIBE", "UNSUBSCRIBE", "PSUBSCRIBE", "PUNSUBSCRIBE", "PING", "QUIT"):
+            return "-ERR only (P)SUBSCRIBE / (P)UNSUBSCRIBE / PING / QUIT allowed in this context\r\n"
         if split_cmd[0] == "PING":
             return "+PONG\r\n"
         elif split_cmd[0] == "ECHO":
@@ -506,6 +513,44 @@ class RedisServer:
                 return resp
             else:
                 return EMPTY_RES
+        elif split_cmd[0] == "SUBSCRIBE":
+            if subscribed_channels is None:
+                subscribed_channels = set()
+            for ch in split_cmd[1:]:
+                if ch not in self.channels:
+                    self.channels[ch] = []
+                if writer not in self.channels[ch]:
+                    self.channels[ch].append(writer)
+                subscribed_channels.add(ch)
+                resp = f"*3\r\n$9\r\nsubscribe\r\n${len(ch)}\r\n{ch}\r\n:{len(subscribed_channels)}\r\n"
+                writer.write(resp.encode())
+                await writer.drain()
+            return None
+        elif split_cmd[0] == "PUBLISH":
+            ch = split_cmd[1]
+            msg = ' '.join(split_cmd[2:])
+            subscribers = self.channels.get(ch, [])
+            resp = f"*3\r\n$7\r\nmessage\r\n${len(ch)}\r\n{ch}\r\n${len(msg)}\r\n{msg}\r\n"
+            for sub_writer in subscribers:
+                try:
+                    sub_writer.write(resp.encode())
+                    await sub_writer.drain()
+                except Exception:
+                    pass
+            return f":{len(subscribers)}\r\n"
+        elif split_cmd[0] == "UNSUBSCRIBE":
+            if subscribed_channels is None:
+                subscribed_channels = set()
+            targets = split_cmd[1:] if len(split_cmd) > 1 else list(subscribed_channels)
+            for ch in targets:
+                if ch in subscribed_channels:
+                    subscribed_channels.remove(ch)
+                    if ch in self.channels and writer in self.channels[ch]:
+                        self.channels[ch].remove(writer)
+                resp = f"*3\r\n$11\r\nunsubscribe\r\n${len(ch)}\r\n{ch}\r\n:{len(subscribed_channels)}\r\n"
+                writer.write(resp.encode())
+                await writer.drain()
+            return None
         else:
             return EMPTY_RES
              
@@ -524,11 +569,20 @@ class RedisServer:
         elif split_command[0] in ("GET", "LLEN", "ECHO", "TYPE", "INCR"):
             if len(split_command) != 2:
                 return "-ERR Missing parameters\r\n"
+        elif split_command[0] == "SUBSCRIBE":
+            if len(split_command) < 2:
+                return "-ERR Missing parameters\r\n"
+        elif split_command[0] == "PUBLISH":
+            if len(split_command) < 3:
+                return "-ERR Missing parameters\r\n"
         elif split_command[0] in ("RPUSH", "LPUSH", "LPOP", "BLPOP", "XADD", "XRANGE", "REPLCONF", "PSYNC", "CONFIG"):
             if len(split_command) < 3:
                 return "-ERR Missing parameters\r\n"
         elif split_command[0] == "LRANGE":
             if len(split_command) != 4:
+                return "-ERR Missing parameters\r\n"
+        elif split_command[0] == "UNSUBSCRIBE":
+            if len(split_command) < 1:
                 return "-ERR Missing parameters\r\n"
         elif split_command[0] == "WAIT":
             if len(split_command) != 3:
