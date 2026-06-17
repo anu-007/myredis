@@ -254,13 +254,109 @@ class RedisServer:
             if value is None:
                 return "+none\r\n"
             elif isinstance(value, list):
-                if isinstance(value[0], dict) and value[0].get("id", None):
+                if len(value) > 0 and isinstance(value[0], tuple) and len(value[0]) == 2:
+                    return "+zset\r\n"
+                elif len(value) > 0 and isinstance(value[0], dict) and value[0].get("id", None):
                     return "+stream\r\n"
                 return "+list\r\n"
             elif isinstance(value, dict) and "val" in value:
                 return "+string\r\n"
             else:
                 return "+none\r\n"
+        elif split_cmd[0] == "ZADD":
+            key = split_cmd[1]
+            if key not in self.map or not self._is_zset(self.map[key]):
+                self.map[key] = []
+            zset = self.map[key]
+            added = 0
+            i = 2
+            while i < len(split_cmd):
+                score = float(split_cmd[i])
+                member = split_cmd[i + 1]
+                found = False
+                for j, (s, m) in enumerate(zset):
+                    if m == member:
+                        zset[j] = (score, member)
+                        found = True
+                        break
+                if not found:
+                    zset.append((score, member))
+                    added += 1
+                i += 2
+            zset.sort(key=lambda x: x[0])
+            await self.propagate_to_replicas(command)
+            return f":{added}\r\n"
+        elif split_cmd[0] == "ZREM":
+            key = split_cmd[1]
+            if key not in self.map or not self._is_zset(self.map[key]):
+                return ":0\r\n"
+            zset = self.map[key]
+            removed = 0
+            for member in split_cmd[2:]:
+                for j, (s, m) in enumerate(zset):
+                    if m == member:
+                        zset.pop(j)
+                        removed += 1
+                        break
+            if len(zset) == 0:
+                del self.map[key]
+            await self.propagate_to_replicas(command)
+            return f":{removed}\r\n"
+        elif split_cmd[0] == "ZRANGE":
+            key = split_cmd[1]
+            start = int(split_cmd[2])
+            stop = int(split_cmd[3])
+            withscores = len(split_cmd) > 4 and "WITHSCORES" in split_cmd
+            if key not in self.map or not self._is_zset(self.map[key]):
+                return "*0\r\n"
+            zset = self.map[key]
+            if start < 0:
+                start = len(zset) + start
+            if stop < 0:
+                stop = len(zset) + stop
+            start = max(0, start)
+            stop = min(len(zset) - 1, stop)
+            if start > stop or start >= len(zset):
+                return "*0\r\n"
+            result = zset[start:stop + 1]
+            if withscores:
+                resp = f"*{len(result) * 2}\r\n"
+                for score, member in result:
+                    member_str = str(member)
+                    score_str = str(score)
+                    resp += f"${len(member_str)}\r\n{member_str}\r\n${len(score_str)}\r\n{score_str}\r\n"
+            else:
+                resp = f"*{len(result)}\r\n"
+                for score, member in result:
+                    member_str = str(member)
+                    resp += f"${len(member_str)}\r\n{member_str}\r\n"
+            return resp
+        elif split_cmd[0] == "ZSCORE":
+            key = split_cmd[1]
+            member = split_cmd[2]
+            if key not in self.map or not self._is_zset(self.map[key]):
+                return EMPTY_RES
+            zset = self.map[key]
+            for score, m in zset:
+                if m == member:
+                    score_str = str(score)
+                    return f"${len(score_str)}\r\n{score_str}\r\n"
+            return EMPTY_RES
+        elif split_cmd[0] == "ZCARD":
+            key = split_cmd[1]
+            if key not in self.map or not self._is_zset(self.map[key]):
+                return ":0\r\n"
+            return f":{len(self.map[key])}\r\n"
+        elif split_cmd[0] == "ZRANK":
+            key = split_cmd[1]
+            member = split_cmd[2]
+            if key not in self.map or not self._is_zset(self.map[key]):
+                return EMPTY_RES
+            zset = self.map[key]
+            for i, (score, m) in enumerate(zset):
+                if m == member:
+                    return f":{i}\r\n"
+            return EMPTY_RES
         elif split_cmd[0] == "XADD":
             key = split_cmd[1]
             valid_id = self.validate_stream_id(command)
@@ -581,6 +677,18 @@ class RedisServer:
         elif split_command[0] == "LRANGE":
             if len(split_command) != 4:
                 return "-ERR Missing parameters\r\n"
+        elif split_command[0] == "ZADD":
+            if len(split_command) < 4:
+                return "-ERR Missing parameters\r\n"
+        elif split_command[0] in ("ZREM", "ZSCORE", "ZRANK"):
+            if len(split_command) < 3:
+                return "-ERR Missing parameters\r\n"
+        elif split_command[0] == "ZCARD":
+            if len(split_command) != 2:
+                return "-ERR Missing parameters\r\n"
+        elif split_command[0] == "ZRANGE":
+            if len(split_command) < 4:
+                return "-ERR Missing parameters\r\n"
         elif split_command[0] == "UNSUBSCRIBE":
             if len(split_command) < 1:
                 return "-ERR Missing parameters\r\n"
@@ -635,6 +743,9 @@ class RedisServer:
             return False
         
         return generate_id(curr_split_id, timestamp, last_id)
+
+    def _is_zset(self, value):
+        return isinstance(value, list) and len(value) > 0 and isinstance(value[0], tuple) and len(value[0]) == 2
 
     def load_rdb(self):
         rdb_path = os.path.join(self.dir, self.dbfile_name)
