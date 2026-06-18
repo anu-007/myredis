@@ -1,5 +1,6 @@
 import asyncio
 import argparse
+import math
 import os
 from datetime import datetime, timedelta
 
@@ -20,6 +21,7 @@ class RedisServer:
         self.replica_acks = {}
         self.dir = dir
         self.dbfile_name = dbfilename
+        self.geo_coords = {}
         self.load_rdb()
         self.channels = {}
 
@@ -298,8 +300,12 @@ class RedisServer:
                         zset.pop(j)
                         removed += 1
                         break
+                if key in self.geo_coords and member in self.geo_coords[key]:
+                    del self.geo_coords[key][member]
             if len(zset) == 0:
                 del self.map[key]
+                if key in self.geo_coords:
+                    del self.geo_coords[key]
             await self.propagate_to_replicas(command)
             return f":{removed}\r\n"
         elif split_cmd[0] == "ZRANGE":
@@ -357,6 +363,160 @@ class RedisServer:
                 if m == member:
                     return f":{i}\r\n"
             return EMPTY_RES
+        elif split_cmd[0] == "GEOADD":
+            key = split_cmd[1]
+            if key not in self.map or not self._is_zset(self.map[key]):
+                self.map[key] = []
+            if key not in self.geo_coords:
+                self.geo_coords[key] = {}
+
+            zset = self.map[key]
+            added = 0
+            i = 2
+            while i < len(split_cmd):
+                lon = float(split_cmd[i])
+                lat = float(split_cmd[i + 1])
+                member = split_cmd[i + 2]
+                score = self._geohash(lon, lat)
+
+                if member not in self.geo_coords[key]:
+                    added += 1
+                self.geo_coords[key][member] = (lon, lat)
+
+                found = False
+                for idx, (_, existing_member) in enumerate(zset):
+                    if existing_member == member:
+                        zset[idx] = (score, member)
+                        found = True
+                        break
+                if not found:
+                    zset.append((score, member))
+                i += 3
+
+            zset.sort(key=lambda x: (x[0], x[1]))
+            await self.propagate_to_replicas(command)
+            return f":{added}\r\n"
+        elif split_cmd[0] == "GEODIST":
+            key = split_cmd[1]
+            member1 = split_cmd[2]
+            member2 = split_cmd[3]
+            unit = "M" if len(split_cmd) < 5 else split_cmd[4].upper()
+
+            if key not in self.geo_coords or member1 not in self.geo_coords[key] or member2 not in self.geo_coords[key]:
+                return EMPTY_RES
+
+            lon1, lat1 = self.geo_coords[key][member1]
+            lon2, lat2 = self.geo_coords[key][member2]
+            dist = self._convert_distance(self._haversine_distance(lon1, lat1, lon2, lat2), unit)
+            dist_str = f"{dist:.4f}".rstrip('0').rstrip('.')
+            return f"${len(dist_str)}\r\n{dist_str}\r\n"
+        elif split_cmd[0] == "GEOPOS":
+            key = split_cmd[1]
+            members = split_cmd[2:]
+            resp = f"*{len(members)}\r\n"
+            for member in members:
+                if key in self.geo_coords and member in self.geo_coords[key]:
+                    lon, lat = self.geo_coords[key][member]
+                    lon_str = str(lon)
+                    lat_str = str(lat)
+                    resp += f"*2\r\n${len(lon_str)}\r\n{lon_str}\r\n${len(lat_str)}\r\n{lat_str}\r\n"
+                else:
+                    resp += EMPTY_RES
+            return resp
+        elif split_cmd[0] == "GEOSEARCH":
+            key = split_cmd[1]
+            if key not in self.geo_coords or key not in self.map or not self._is_zset(self.map[key]):
+                return "*0\r\n"
+
+            idx = 2
+            center_lon, center_lat = None, None
+            radius = None
+            box_width = None
+            box_height = None
+            unit = "M"
+            sort_order = None
+            count = None
+            withdist = False
+            withhash = False
+            withcoord = False
+
+            while idx < len(split_cmd):
+                opt = split_cmd[idx].upper()
+                if opt == "FROMMEMBER":
+                    member = split_cmd[idx + 1]
+                    if member in self.geo_coords[key]:
+                        center_lon, center_lat = self.geo_coords[key][member]
+                    idx += 2
+                elif opt == "FROMLONLAT":
+                    center_lon = float(split_cmd[idx + 1])
+                    center_lat = float(split_cmd[idx + 2])
+                    idx += 3
+                elif opt == "BYRADIUS":
+                    radius = self._distance_to_meters(float(split_cmd[idx + 1]), split_cmd[idx + 2].upper())
+                    unit = split_cmd[idx + 2].upper()
+                    idx += 3
+                elif opt == "BYBOX":
+                    box_width = self._distance_to_meters(float(split_cmd[idx + 1]), split_cmd[idx + 3].upper())
+                    box_height = self._distance_to_meters(float(split_cmd[idx + 2]), split_cmd[idx + 3].upper())
+                    unit = split_cmd[idx + 3].upper()
+                    idx += 4
+                elif opt in ("ASC", "DESC"):
+                    sort_order = opt
+                    idx += 1
+                elif opt == "COUNT":
+                    count = int(split_cmd[idx + 1])
+                    idx += 2
+                elif opt == "WITHDIST":
+                    withdist = True
+                    idx += 1
+                elif opt == "WITHHASH":
+                    withhash = True
+                    idx += 1
+                elif opt == "WITHCOORD":
+                    withcoord = True
+                    idx += 1
+                else:
+                    idx += 1
+
+            if center_lon is None or (radius is None and (box_width is None or box_height is None)):
+                return "-ERR syntax error\r\n"
+
+            score_by_member = {member: score for score, member in self.map[key]}
+            results = []
+            for member, (lon, lat) in self.geo_coords[key].items():
+                dist_m = self._haversine_distance(center_lon, center_lat, lon, lat)
+                if radius is not None:
+                    include = dist_m <= radius
+                else:
+                    include = self._inside_geo_box(center_lon, center_lat, lon, lat, box_width, box_height)
+                if include:
+                    results.append((member, dist_m, lon, lat, score_by_member.get(member, self._geohash(lon, lat))))
+
+            if sort_order == "ASC":
+                results.sort(key=lambda x: x[1])
+            elif sort_order == "DESC":
+                results.sort(key=lambda x: x[1], reverse=True)
+            if count is not None:
+                results = results[:count]
+
+            resp = f"*{len(results)}\r\n"
+            for member, dist_m, lon, lat, score in results:
+                if withdist or withhash or withcoord:
+                    elements = 1 + int(withdist) + int(withhash) + int(withcoord)
+                    resp += f"*{elements}\r\n"
+                resp += f"${len(member)}\r\n{member}\r\n"
+                if withdist:
+                    dist = self._convert_distance(dist_m, unit)
+                    dist_str = f"{dist:.4f}".rstrip('0').rstrip('.')
+                    resp += f"${len(dist_str)}\r\n{dist_str}\r\n"
+                if withhash:
+                    score_str = str(score)
+                    resp += f"${len(score_str)}\r\n{score_str}\r\n"
+                if withcoord:
+                    lon_str = str(lon)
+                    lat_str = str(lat)
+                    resp += f"*2\r\n${len(lon_str)}\r\n{lon_str}\r\n${len(lat_str)}\r\n{lat_str}\r\n"
+            return resp
         elif split_cmd[0] == "XADD":
             key = split_cmd[1]
             valid_id = self.validate_stream_id(command)
@@ -689,6 +849,18 @@ class RedisServer:
         elif split_command[0] == "ZRANGE":
             if len(split_command) < 4:
                 return "-ERR Missing parameters\r\n"
+        elif split_command[0] == "GEOADD":
+            if len(split_command) < 5 or (len(split_command) - 2) % 3 != 0:
+                return "-ERR Missing parameters\r\n"
+        elif split_command[0] == "GEODIST":
+            if len(split_command) < 4 or len(split_command) > 5:
+                return "-ERR Missing parameters\r\n"
+        elif split_command[0] == "GEOPOS":
+            if len(split_command) < 3:
+                return "-ERR Missing parameters\r\n"
+        elif split_command[0] == "GEOSEARCH":
+            if len(split_command) < 6:
+                return "-ERR Missing parameters\r\n"
         elif split_command[0] == "UNSUBSCRIBE":
             if len(split_command) < 1:
                 return "-ERR Missing parameters\r\n"
@@ -746,6 +918,65 @@ class RedisServer:
 
     def _is_zset(self, value):
         return isinstance(value, list) and len(value) > 0 and isinstance(value[0], tuple) and len(value[0]) == 2
+
+    def _distance_to_meters(self, distance, unit):
+        if unit == "KM":
+            return distance * 1000
+        if unit == "MI":
+            return distance * 1609.344
+        if unit == "FT":
+            return distance * 0.3048
+        return distance
+
+    def _convert_distance(self, distance_m, unit):
+        if unit == "KM":
+            return distance_m / 1000
+        if unit == "MI":
+            return distance_m / 1609.344
+        if unit == "FT":
+            return distance_m / 0.3048
+        return distance_m
+
+    def _haversine_distance(self, lon1, lat1, lon2, lat2):
+        earth_radius_m = 6371000
+        phi1 = math.radians(lat1)
+        phi2 = math.radians(lat2)
+        dphi = math.radians(lat2 - lat1)
+        dlambda = math.radians(lon2 - lon1)
+        a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
+        c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+        return earth_radius_m * c
+
+    def _inside_geo_box(self, center_lon, center_lat, lon, lat, width_m, height_m):
+        meters_per_degree_lat = 111320
+        meters_per_degree_lon = meters_per_degree_lat * math.cos(math.radians(center_lat))
+        if meters_per_degree_lon == 0:
+            meters_per_degree_lon = 1
+        half_width_deg = (width_m / 2) / meters_per_degree_lon
+        half_height_deg = (height_m / 2) / meters_per_degree_lat
+        return abs(lon - center_lon) <= half_width_deg and abs(lat - center_lat) <= half_height_deg
+
+    def _geohash(self, lon, lat):
+        lon_min, lon_max = -180.0, 180.0
+        lat_min, lat_max = -90.0, 90.0
+        geohash = 0
+        for _ in range(26):
+            geohash <<= 1
+            lon_mid = (lon_min + lon_max) / 2
+            if lon >= lon_mid:
+                geohash |= 1
+                lon_min = lon_mid
+            else:
+                lon_max = lon_mid
+
+            geohash <<= 1
+            lat_mid = (lat_min + lat_max) / 2
+            if lat >= lat_mid:
+                geohash |= 1
+                lat_min = lat_mid
+            else:
+                lat_max = lat_mid
+        return geohash
 
     def load_rdb(self):
         rdb_path = os.path.join(self.dir, self.dbfile_name)
