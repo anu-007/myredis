@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 EMPTY_RES = "$-1\r\n"
 
 class RedisServer:
-    def __init__(self, host="localhost", port=6378, replica_of=None, dir="/tmp/redis-data", dbfilename="dump.rdb"):
+    def __init__(self, host="localhost", port=6378, replica_of=None, dir="/tmp/redis-data", dbfilename="dump.rdb", password=None):
         self.host = host
         self.port = port
         self.map = {}
@@ -21,6 +21,9 @@ class RedisServer:
         self.replica_acks = {}
         self.dir = dir
         self.dbfile_name = dbfilename
+        self.password = password
+        self.users = {"default": password} if password else {}
+        self.authenticated_clients = {}
         self.geo_coords = {}
         self.load_rdb()
         self.channels = {}
@@ -133,6 +136,8 @@ class RedisServer:
             for ch in list(subscribed_channels):
                 if ch in self.channels and writer in self.channels[ch]:
                     self.channels[ch].remove(writer)
+            if writer in self.authenticated_clients:
+                del self.authenticated_clients[writer]
             writer.close()
             await writer.wait_closed()
     
@@ -151,8 +156,48 @@ class RedisServer:
             return EMPTY_RES
         if subscribed_channels and split_cmd[0] not in ("SUBSCRIBE", "UNSUBSCRIBE", "PSUBSCRIBE", "PUNSUBSCRIBE", "PING", "QUIT"):
             return "-ERR only (P)SUBSCRIBE / (P)UNSUBSCRIBE / PING / QUIT allowed in this context\r\n"
+        if self.password and split_cmd[0] not in ("AUTH", "PING", "QUIT"):
+            if writer is None or (writer is not self.master_writer and writer not in self.authenticated_clients):
+                return "-NOAUTH Authentication required.\r\n"
         if split_cmd[0] == "PING":
             return "+PONG\r\n"
+        elif split_cmd[0] == "AUTH":
+            if len(split_cmd) == 2:
+                username = "default"
+                password = split_cmd[1]
+            elif len(split_cmd) == 3:
+                username = split_cmd[1]
+                password = split_cmd[2]
+            else:
+                return "-ERR wrong number of arguments for 'auth' command\r\n"
+            if not self.password:
+                if writer:
+                    self.authenticated_clients[writer] = username
+                return "+OK\r\n"
+            if username in self.users and self.users[username] == password:
+                if writer:
+                    self.authenticated_clients[writer] = username
+                return "+OK\r\n"
+            return "-ERR invalid username-password pair or user is disabled.\r\n"
+        elif split_cmd[0] == "WHOAMI":
+            if writer and writer in self.authenticated_clients:
+                username = self.authenticated_clients[writer]
+                return f"${len(username)}\r\n{username}\r\n"
+            elif not self.password:
+                return "$7\r\ndefault\r\n"
+            return "-ERR not authenticated\r\n"
+        elif split_cmd[0] == "GETUSER":
+            username = split_cmd[1]
+            if username not in self.users:
+                return "-ERR User not found\r\n"
+            password = self.users[username]
+            resp = f"*4\r\n$4\r\nuser\r\n${len(username)}\r\n{username}\r\n$8\r\npassword\r\n${len(password)}\r\n{password}\r\n"
+            return resp
+        elif split_cmd[0] == "SETUSER":
+            username = split_cmd[1]
+            password = split_cmd[2]
+            self.users[username] = password
+            return "+OK\r\n"
         elif split_cmd[0] == "ECHO":
             val = split_cmd[1]
             return f"${len(val)}\r\n{val}\r\n"
@@ -861,6 +906,18 @@ class RedisServer:
         elif split_command[0] == "GEOSEARCH":
             if len(split_command) < 6:
                 return "-ERR Missing parameters\r\n"
+        elif split_command[0] == "AUTH":
+            if len(split_command) not in (2, 3):
+                return "-ERR Missing parameters\r\n"
+        elif split_command[0] == "WHOAMI":
+            if len(split_command) != 1:
+                return "-ERR Missing parameters\r\n"
+        elif split_command[0] == "GETUSER":
+            if len(split_command) != 2:
+                return "-ERR Missing parameters\r\n"
+        elif split_command[0] == "SETUSER":
+            if len(split_command) != 3:
+                return "-ERR Missing parameters\r\n"
         elif split_command[0] == "UNSUBSCRIBE":
             if len(split_command) < 1:
                 return "-ERR Missing parameters\r\n"
@@ -1120,9 +1177,10 @@ if __name__ == "__main__":
     parser.add_argument('--replica-of', type=str, default=None, help='Master server to replicate from (default: None)')
     parser.add_argument('--dir', type=str, default='/tmp/redis-data', help='Directory for RDB files')
     parser.add_argument('--dbfilename', type=str, default='dump.rdb', help='RDB filename')
+    parser.add_argument('--password', type=str, default=None, help='Password required for AUTH')
     args = parser.parse_args()
 
-    redis_server = RedisServer(port=args.port, replica_of=args.replica_of, dir=args.dir, dbfilename=args.dbfilename)
+    redis_server = RedisServer(port=args.port, replica_of=args.replica_of, dir=args.dir, dbfilename=args.dbfilename, password=args.password)
     try:
         asyncio.run(redis_server.start())
     except KeyboardInterrupt:
