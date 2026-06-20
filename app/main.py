@@ -25,6 +25,8 @@ class RedisServer:
         self.users = {"default": password} if password else {}
         self.authenticated_clients = {}
         self.geo_coords = {}
+        self.watched_keys = {}
+        self.watched_keys_dirty = {}
         self.load_rdb()
         self.channels = {}
 
@@ -57,7 +59,7 @@ class RedisServer:
                 if cmd:
                     print("Replication command:", cmd)
                     # Process the command (this will update replication_offset)
-                    await self.process_command(cmd, transaction=False, queue=[], writer=self.master_writer)
+                    await self.process_command(cmd, {"active": False, "queue": [], "watched_keys": set(), "watched_dirty": False}, writer=self.master_writer)
 
     async def connect_to_master(self):
         host, port = self.replica_of.split(":")
@@ -100,8 +102,7 @@ class RedisServer:
         asyncio.create_task(self.receive_replication())
 
     async def handleTask(self, reader:asyncio.StreamReader, writer:asyncio.StreamWriter):
-        queue = []
-        transaction = False
+        transaction_state = {"active": False, "queue": [], "watched_keys": set(), "watched_dirty": False}
         subscribed_channels = set()
         try:
             while True:
@@ -122,7 +123,7 @@ class RedisServer:
                 else:
                     command = line.decode().strip()
 
-                response = await self.process_command(command, transaction, queue, writer, subscribed_channels)
+                response = await self.process_command(command, transaction_state, writer, subscribed_channels)
                 if response:
                     writer.write(response.encode())
                     await writer.drain()
@@ -138,22 +139,30 @@ class RedisServer:
                     self.channels[ch].remove(writer)
             if writer in self.authenticated_clients:
                 del self.authenticated_clients[writer]
+            if writer in self.watched_keys:
+                del self.watched_keys[writer]
+            if writer in self.watched_keys_dirty:
+                del self.watched_keys_dirty[writer]
             writer.close()
             await writer.wait_closed()
     
-    async def process_command(self, command: str, transaction: bool, queue: list, writer: asyncio.StreamWriter = None, subscribed_channels: set = None):
+    async def process_command(self, command: str, transaction_state: dict, writer: asyncio.StreamWriter = None, subscribed_channels: set = None):
         issue = self.validate_command(command)
 
         if issue:
             return issue
 
-        if transaction:
-            queue.append(command)
-            return "QUEUED\r\n"
-
         split_cmd = command.split()
         if not split_cmd:
             return EMPTY_RES
+
+        if transaction_state["active"]:
+            if split_cmd[0] == "WATCH":
+                return "-ERR WATCH inside MULTI is not allowed\r\n"
+            if split_cmd[0] not in ("EXEC", "DISCARD"):
+                transaction_state["queue"].append(command)
+                return "QUEUED\r\n"
+            # EXEC and DISCARD fall through to be processed below
         if subscribed_channels and split_cmd[0] not in ("SUBSCRIBE", "UNSUBSCRIBE", "PSUBSCRIBE", "PUNSUBSCRIBE", "PING", "QUIT"):
             return "-ERR only (P)SUBSCRIBE / (P)UNSUBSCRIBE / PING / QUIT allowed in this context\r\n"
         if self.password and split_cmd[0] not in ("AUTH", "PING", "QUIT"):
@@ -212,6 +221,7 @@ class RedisServer:
                 value_obj["exp"] = -1
 
             self.map[key] = value_obj
+            self._watch_touch_key(key)
             await self.propagate_to_replicas(command)
             return "+OK\r\n"
         elif split_cmd[0] == "GET":
@@ -237,6 +247,7 @@ class RedisServer:
                     else:
                         self.map[split_cmd[1]] = [split_cmd[idx]] + self.map.get(split_cmd[1], [])
 
+            self._watch_touch_key(split_cmd[1])
             return f":{len(self.map[split_cmd[1]])}\r\n"
         elif split_cmd[0] == "LRANGE":
             value_list = self.map.get(split_cmd[1], [])
@@ -265,6 +276,7 @@ class RedisServer:
                     el = value_list.pop()
                     elem_removed.append(el)
             self.map[split_cmd[1]] = value_list
+            self._watch_touch_key(split_cmd[1])
 
             resp = f"*{len(elem_removed)}\r\n"
             for item in elem_removed:
@@ -277,8 +289,9 @@ class RedisServer:
             if value_list_len > 0:
                 el = value_list.pop(0)
                 self.map[split_cmd[1]] = value_list
+                self._watch_touch_key(split_cmd[1])
                 return f"*2\r\n${len(split_cmd[1])}\r\n{split_cmd[1]}\r\n${len(el)}\r\n{el}\r\n"
-            
+
             if int(split_cmd[2]) == 0:
                 while not len(self.map.get(split_cmd[1], [])):
                     await asyncio.sleep(0.1)
@@ -288,11 +301,12 @@ class RedisServer:
                     if self.map.get(split_cmd[1]):
                         break
                     await asyncio.sleep(0.1)
-            
+
             value_list = self.map.get(split_cmd[1], [])
             if value_list:
                 el = value_list.pop(0)
                 self.map[split_cmd[1]] = value_list
+                self._watch_touch_key(split_cmd[1])
                 return f"*2\r\n${len(split_cmd[1])}\r\n{split_cmd[1]}\r\n${len(el)}\r\n{el}\r\n"
             else:
                 return EMPTY_RES
@@ -331,6 +345,7 @@ class RedisServer:
                     added += 1
                 i += 2
             zset.sort(key=lambda x: x[0])
+            self._watch_touch_key(key)
             await self.propagate_to_replicas(command)
             return f":{added}\r\n"
         elif split_cmd[0] == "ZREM":
@@ -351,6 +366,7 @@ class RedisServer:
                 del self.map[key]
                 if key in self.geo_coords:
                     del self.geo_coords[key]
+            self._watch_touch_key(key)
             await self.propagate_to_replicas(command)
             return f":{removed}\r\n"
         elif split_cmd[0] == "ZRANGE":
@@ -439,6 +455,7 @@ class RedisServer:
                 i += 3
 
             zset.sort(key=lambda x: (x[0], x[1]))
+            self._watch_touch_key(key)
             await self.propagate_to_replicas(command)
             return f":{added}\r\n"
         elif split_cmd[0] == "GEODIST":
@@ -575,6 +592,7 @@ class RedisServer:
 
             value.append(curr_obj)
             self.map[key] = value
+            self._watch_touch_key(key)
             return f"${len(valid_id)}\r\n{valid_id}\r\n"
         elif split_cmd[0] == "XRANGE":
             values = self.map.get(split_cmd[1], [])
@@ -695,29 +713,58 @@ class RedisServer:
             else:
                 return "-ERR value is not an integer or out of range\r\n"
 
+            self._watch_touch_key(split_cmd[1])
             return f":{self.map[split_cmd[1]]}\r\n"
         elif split_cmd[0] == "MULTI":
-            transaction = True
+            transaction_state["active"] = True
+            return "+OK\r\n"
+        elif split_cmd[0] == "WATCH":
+            if transaction_state["active"]:
+                return "-ERR WATCH inside MULTI is not allowed\r\n"
+            for key in split_cmd[1:]:
+                transaction_state["watched_keys"].add(key)
+                self.watched_keys.setdefault(writer, set()).add(key)
+            self.watched_keys_dirty.pop(writer, None)
+            return "+OK\r\n"
+        elif split_cmd[0] == "UNWATCH":
+            transaction_state["watched_keys"].clear()
+            if writer in self.watched_keys:
+                del self.watched_keys[writer]
+            self.watched_keys_dirty.pop(writer, None)
             return "+OK\r\n"
         elif split_cmd[0] == "EXEC":
-            if not transaction:
+            if not transaction_state["active"]:
                 return "-ERR EXEC without MULTI\r\n"
 
-            transaction = False
+            if transaction_state["watched_dirty"] or self.watched_keys_dirty.get(writer, False):
+                transaction_state["active"] = False
+                transaction_state["queue"].clear()
+                transaction_state["watched_keys"].clear()
+                self.watched_keys.pop(writer, None)
+                self.watched_keys_dirty.pop(writer, None)
+                return "*-1\r\n"
+
+            transaction_state["active"] = False
             result = []
-            for command in queue:
-                result.append(await self.process_command(command, transaction=False, queue=[], writer=writer))
-            queue = []
+            for command in transaction_state["queue"]:
+                result.append(await self.process_command(command, {"active": False, "queue": [], "watched_keys": set(), "watched_dirty": False}, writer=writer))
+            transaction_state["queue"].clear()
+            transaction_state["watched_keys"].clear()
+            self.watched_keys.pop(writer, None)
+            self.watched_keys_dirty.pop(writer, None)
             resp = f"*{len(result)}\r\n"
             for item in result:
                 resp += item
             return resp
         elif split_cmd[0] == "DISCARD":
-            if not transaction:
+            if not transaction_state["active"]:
                 return "-ERR DISCARD without MULTI\r\n"
 
-            transaction = False
-            queue = []
+            transaction_state["active"] = False
+            transaction_state["queue"].clear()
+            transaction_state["watched_keys"].clear()
+            self.watched_keys.pop(writer, None)
+            self.watched_keys_dirty.pop(writer, None)
             return "+OK\r\n"
         elif split_cmd[0] == "INFO":
             if self.replica_of is None:
@@ -858,7 +905,7 @@ class RedisServer:
     def validate_command(self, command: str):
         split_command = command.split()
 
-        if split_command[0] in ("PING", "MULTI", "EXEC", "DISCARD", "INFO"):
+        if split_command[0] in ("PING", "MULTI", "EXEC", "DISCARD", "INFO", "UNWATCH"):
             if len(split_command) != 1:
                 return "-ERR Missing parameters\r\n"
         elif split_command[0] == "SET" and ("EX" in split_command or "PX" in split_command):
@@ -869,6 +916,9 @@ class RedisServer:
                 return "-ERR Missing parameters\r\n"
         elif split_command[0] in ("GET", "LLEN", "ECHO", "TYPE", "INCR"):
             if len(split_command) != 2:
+                return "-ERR Missing parameters\r\n"
+        elif split_command[0] == "WATCH":
+            if len(split_command) < 2:
                 return "-ERR Missing parameters\r\n"
         elif split_command[0] == "SUBSCRIBE":
             if len(split_command) < 2:
@@ -975,6 +1025,11 @@ class RedisServer:
 
     def _is_zset(self, value):
         return isinstance(value, list) and len(value) > 0 and isinstance(value[0], tuple) and len(value[0]) == 2
+
+    def _watch_touch_key(self, key):
+        for watcher, keys in self.watched_keys.items():
+            if key in keys:
+                self.watched_keys_dirty[watcher] = True
 
     def _distance_to_meters(self, distance, unit):
         if unit == "KM":
