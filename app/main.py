@@ -1,5 +1,6 @@
 import asyncio
 import argparse
+import json
 import math
 import os
 from datetime import datetime, timedelta
@@ -7,7 +8,7 @@ from datetime import datetime, timedelta
 EMPTY_RES = "$-1\r\n"
 
 class RedisServer:
-    def __init__(self, host="localhost", port=6378, replica_of=None, dir="/tmp/redis-data", dbfilename="dump.rdb", password=None):
+    def __init__(self, host="localhost", port=6378, replica_of=None, dir="/tmp/redis-data", dbfilename="dump.rdb", password=None, appendonly=False, appendfilename="appendonly.aof", appendfsync="no"):
         self.host = host
         self.port = port
         self.map = {}
@@ -27,6 +28,11 @@ class RedisServer:
         self.geo_coords = {}
         self.watched_keys = {}
         self.watched_keys_dirty = {}
+        self.aof_enabled = appendonly
+        self.aof_filename = appendfilename
+        self.aof_fsync = appendfsync
+        self.aof_file = None
+        self.aof_loading = False
         self.load_rdb()
         self.channels = {}
 
@@ -223,6 +229,7 @@ class RedisServer:
             self.map[key] = value_obj
             self._watch_touch_key(key)
             await self.propagate_to_replicas(command)
+            self._aof_append(command)
             return "+OK\r\n"
         elif split_cmd[0] == "GET":
             if split_cmd[1] in self.map:
@@ -248,6 +255,7 @@ class RedisServer:
                         self.map[split_cmd[1]] = [split_cmd[idx]] + self.map.get(split_cmd[1], [])
 
             self._watch_touch_key(split_cmd[1])
+            self._aof_append(command)
             return f":{len(self.map[split_cmd[1]])}\r\n"
         elif split_cmd[0] == "LRANGE":
             value_list = self.map.get(split_cmd[1], [])
@@ -277,6 +285,7 @@ class RedisServer:
                     elem_removed.append(el)
             self.map[split_cmd[1]] = value_list
             self._watch_touch_key(split_cmd[1])
+            self._aof_append(command)
 
             resp = f"*{len(elem_removed)}\r\n"
             for item in elem_removed:
@@ -290,6 +299,7 @@ class RedisServer:
                 el = value_list.pop(0)
                 self.map[split_cmd[1]] = value_list
                 self._watch_touch_key(split_cmd[1])
+                self._aof_append(command)
                 return f"*2\r\n${len(split_cmd[1])}\r\n{split_cmd[1]}\r\n${len(el)}\r\n{el}\r\n"
 
             if int(split_cmd[2]) == 0:
@@ -307,6 +317,7 @@ class RedisServer:
                 el = value_list.pop(0)
                 self.map[split_cmd[1]] = value_list
                 self._watch_touch_key(split_cmd[1])
+                self._aof_append(command)
                 return f"*2\r\n${len(split_cmd[1])}\r\n{split_cmd[1]}\r\n${len(el)}\r\n{el}\r\n"
             else:
                 return EMPTY_RES
@@ -347,6 +358,7 @@ class RedisServer:
             zset.sort(key=lambda x: x[0])
             self._watch_touch_key(key)
             await self.propagate_to_replicas(command)
+            self._aof_append(command)
             return f":{added}\r\n"
         elif split_cmd[0] == "ZREM":
             key = split_cmd[1]
@@ -368,6 +380,7 @@ class RedisServer:
                     del self.geo_coords[key]
             self._watch_touch_key(key)
             await self.propagate_to_replicas(command)
+            self._aof_append(command)
             return f":{removed}\r\n"
         elif split_cmd[0] == "ZRANGE":
             key = split_cmd[1]
@@ -457,6 +470,7 @@ class RedisServer:
             zset.sort(key=lambda x: (x[0], x[1]))
             self._watch_touch_key(key)
             await self.propagate_to_replicas(command)
+            self._aof_append(command)
             return f":{added}\r\n"
         elif split_cmd[0] == "GEODIST":
             key = split_cmd[1]
@@ -593,6 +607,7 @@ class RedisServer:
             value.append(curr_obj)
             self.map[key] = value
             self._watch_touch_key(key)
+            self._aof_append(command)
             return f"${len(valid_id)}\r\n{valid_id}\r\n"
         elif split_cmd[0] == "XRANGE":
             values = self.map.get(split_cmd[1], [])
@@ -714,6 +729,7 @@ class RedisServer:
                 return "-ERR value is not an integer or out of range\r\n"
 
             self._watch_touch_key(split_cmd[1])
+            self._aof_append(command)
             return f":{self.map[split_cmd[1]]}\r\n"
         elif split_cmd[0] == "MULTI":
             transaction_state["active"] = True
@@ -1100,6 +1116,82 @@ class RedisServer:
         except Exception as e:
             print(f"Error loading RDB: {e}")
 
+    def _aof_path(self):
+        return os.path.join(self.dir, self.aof_filename)
+
+    def _aof_manifest_path(self):
+        return os.path.join(self.dir, self.aof_filename + ".manifest")
+
+    def _aof_rewrite_manifest(self):
+        if not self.aof_enabled:
+            return
+        manifest = {
+            "version": "1.0",
+            "files": [
+                {
+                    "type": "aof",
+                    "file": self.aof_filename
+                }
+            ]
+        }
+        try:
+            os.makedirs(self.dir, exist_ok=True)
+            with open(self._aof_manifest_path(), 'w') as f:
+                json.dump(manifest, f)
+        except Exception as e:
+            print(f"Error writing AOF manifest: {e}")
+
+    def _aof_open(self):
+        if not self.aof_enabled or self.aof_file:
+            return
+        try:
+            os.makedirs(self.dir, exist_ok=True)
+            self.aof_file = open(self._aof_path(), 'a')
+            self._aof_rewrite_manifest()
+        except Exception as e:
+            print(f"Error opening AOF: {e}")
+
+    def _aof_append(self, command: str):
+        if not self.aof_enabled or self.aof_loading or not command:
+            return
+        self._aof_open()
+        if not self.aof_file:
+            return
+        try:
+            self.aof_file.write(command + "\r\n")
+            self.aof_file.flush()
+            if self.aof_fsync == "always":
+                os.fsync(self.aof_file.fileno())
+        except Exception as e:
+            print(f"Error appending to AOF: {e}")
+
+    def _aof_close(self):
+        if self.aof_file:
+            try:
+                self.aof_file.close()
+            except Exception as e:
+                print(f"Error closing AOF: {e}")
+            self.aof_file = None
+
+    async def load_aof(self):
+        if not self.aof_enabled:
+            return
+        aof_path = self._aof_path()
+        if not os.path.exists(aof_path):
+            return
+        try:
+            self.aof_loading = True
+            with open(aof_path, 'r') as f:
+                for line in f:
+                    cmd = line.strip()
+                    if cmd:
+                        await self.process_command(cmd, {"active": False, "queue": [], "watched_keys": set(), "watched_dirty": False}, writer=None)
+        except Exception as e:
+            print(f"Error loading AOF: {e}")
+        finally:
+            self.aof_loading = False
+            self._aof_open()
+
     def _read_length_encoded_integer(self, data: bytes, idx: int):
         """Read a length-encoded integer from data at idx. Returns (value, new_idx)."""
         byte = data[idx]
@@ -1216,6 +1308,7 @@ class RedisServer:
                 idx += 1
 
     async def start(self):
+        await self.load_aof()
         server = await asyncio.start_server(self.handleTask, self.host, self.port)
         print(f"Redis running on {self.host}:{self.port} as {self.role}")
 
@@ -1233,9 +1326,12 @@ if __name__ == "__main__":
     parser.add_argument('--dir', type=str, default='/tmp/redis-data', help='Directory for RDB files')
     parser.add_argument('--dbfilename', type=str, default='dump.rdb', help='RDB filename')
     parser.add_argument('--password', type=str, default=None, help='Password required for AUTH')
+    parser.add_argument('--appendonly', action='store_true', help='Enable AOF persistence')
+    parser.add_argument('--appendfilename', type=str, default='appendonly.aof', help='AOF filename')
+    parser.add_argument('--appendfsync', type=str, default='no', choices=['always', 'everysec', 'no'], help='AOF fsync policy')
     args = parser.parse_args()
 
-    redis_server = RedisServer(port=args.port, replica_of=args.replica_of, dir=args.dir, dbfilename=args.dbfilename, password=args.password)
+    redis_server = RedisServer(port=args.port, replica_of=args.replica_of, dir=args.dir, dbfilename=args.dbfilename, password=args.password, appendonly=args.appendonly, appendfilename=args.appendfilename, appendfsync=args.appendfsync)
     try:
         asyncio.run(redis_server.start())
     except KeyboardInterrupt:
